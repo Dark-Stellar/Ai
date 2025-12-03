@@ -1,0 +1,763 @@
+"""
+Complete Human Expression & Body Language Detection System
+with Self-Learning Capabilities
+Author: AI Assistant
+Version: 2.0
+"""
+
+import cv2
+import numpy as np
+import json
+import csv
+import pickle
+import mediapipe as mp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms, models
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+from datetime import datetime
+import os
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== CONFIGURATION ====================
+class Config:
+    """Configuration parameters for the system"""
+    # Paths
+    DATA_DIR = Path("expression_data")
+    MODELS_DIR = Path("saved_models")
+    TRAINING_DATA_DIR = Path("training_data")
+    
+    # File storage
+    JSON_OUTPUT = DATA_DIR / "expressions.json"
+    CSV_OUTPUT = DATA_DIR / "expressions.csv"
+    SQLITE_DB = DATA_DIR / "expressions.db"
+    
+    # Model parameters
+    FACE_CONFIDENCE = 0.7
+    POSE_CONFIDENCE = 0.5
+    EMOTION_THRESHOLD = 0.6
+    
+    # Image processing
+    IMG_SIZE = 224
+    BATCH_SIZE = 32
+    
+    # Self-learning
+    UNCERTAINTY_THRESHOLD = 0.3  # Collect samples when model is uncertain
+    MIN_TRAINING_SAMPLES = 100   # Minimum samples before retraining
+    
+    def __init__(self):
+        # Create directories if they don't exist
+        self.DATA_DIR.mkdir(exist_ok=True)
+        self.MODELS_DIR.mkdir(exist_ok=True)
+        self.TRAINING_DATA_DIR.mkdir(exist_ok=True)
+
+# ==================== EMOTION DETECTION MODEL ====================
+class EmotionDetector(nn.Module):
+    """Deep Learning model for facial expression recognition"""
+    def __init__(self, num_emotions=7, pretrained=True):
+        super(EmotionDetector, self).__init__()
+        # Use EfficientNet as backbone
+        self.backbone = models.efficientnet_b0(pretrained=pretrained)
+        
+        # Replace classifier
+        num_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Identity()
+        
+        # Emotion classification head
+        self.emotion_head = nn.Sequential(
+            nn.Linear(num_features, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_emotions)
+        )
+        
+        # Emotion labels (FER2013 standard)
+        self.emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 
+                              'Sad', 'Surprise', 'Neutral']
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        emotions = self.emotion_head(features)
+        return F.softmax(emotions, dim=1), features
+
+# ==================== POSE DETECTION ====================
+class PoseDetector:
+    """Detects human body pose and classifies activities"""
+    def __init__(self):
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=2,
+            enable_segmentation=False,
+            min_detection_confidence=0.5
+        )
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Activity classifier based on pose keypoints
+        self.activity_labels = ['walking', 'sitting', 'standing', 
+                               'running', 'jumping', 'lying']
+        self.activity_classifier = RandomForestClassifier(n_estimators=100)
+        self.pose_encoder = LabelEncoder()
+        
+    def extract_pose_features(self, landmarks):
+        """Extract meaningful features from pose landmarks"""
+        if landmarks is None:
+            return None
+            
+        features = []
+        # Extract key angles and distances
+        keypoints = []
+        for landmark in landmarks.landmark:
+            keypoints.extend([landmark.x, landmark.y, landmark.z])
+        
+        # Calculate body part angles
+        # Shoulder angles
+        features.extend(self.calculate_angle(keypoints, 11, 13, 15))  # Right arm
+        features.extend(self.calculate_angle(keypoints, 12, 14, 16))  # Left arm
+        
+        # Hip angles
+        features.extend(self.calculate_angle(keypoints, 23, 25, 27))  # Right leg
+        features.extend(self.calculate_angle(keypoints, 24, 26, 28))  # Left leg
+        
+        # Torso orientation
+        features.extend(self.calculate_torso_angle(keypoints))
+        
+        return np.array(features)
+    
+    def calculate_angle(self, points, a, b, c):
+        """Calculate angle between three points"""
+        try:
+            a = np.array([points[a*3], points[a*3+1], points[a*3+2]])
+            b = np.array([points[b*3], points[b*3+1], points[b*3+2]])
+            c = np.array([points[c*3], points[c*3+1], points[c*3+2]])
+            
+            ba = a - b
+            bc = c - b
+            
+            cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+            angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+            
+            return [np.degrees(angle)]
+        except:
+            return [0.0]
+    
+    def calculate_torso_angle(self, points):
+        """Calculate torso orientation"""
+        try:
+            # Using shoulders and hips
+            shoulder_center = (np.array([points[11*3], points[11*3+1]]) + 
+                             np.array([points[12*3], points[12*3+1]])) / 2
+            hip_center = (np.array([points[23*3], points[23*3+1]]) + 
+                         np.array([points[24*3], points[24*3+1]])) / 2
+            
+            angle = np.arctan2(hip_center[1] - shoulder_center[1],
+                             hip_center[0] - shoulder_center[0])
+            return [np.degrees(angle)]
+        except:
+            return [0.0]
+
+# ==================== FACE DETECTOR ====================
+class FaceDetector:
+    """Detects faces using MediaPipe Face Detection"""
+    def __init__(self):
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            model_selection=1,  # 0 for short-range, 1 for full-range
+            min_detection_confidence=0.7
+        )
+    
+    def detect_faces(self, image):
+        """Detect faces in image and return bounding boxes"""
+        results = self.face_detection.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        
+        faces = []
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                h, w, _ = image.shape
+                
+                # Convert normalized coordinates to pixel values
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                width = int(bbox.width * w)
+                height = int(bbox.height * h)
+                
+                # Ensure coordinates are within image bounds
+                x = max(0, x)
+                y = max(0, y)
+                width = min(width, w - x)
+                height = min(height, h - y)
+                
+                faces.append({
+                    'bbox': (x, y, width, height),
+                    'confidence': detection.score[0]
+                })
+        
+        return faces
+
+# ==================== DATA STORAGE ====================
+class DataStorage:
+    """Handles storage of extracted data in multiple formats"""
+    def __init__(self, config):
+        self.config = config
+        self.csv_file = config.CSV_OUTPUT
+        self.json_file = config.JSON_OUTPUT
+        self.initialize_storage()
+    
+    def initialize_storage(self):
+        """Initialize storage files with headers"""
+        # CSV initialization
+        if not self.csv_file.exists():
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'image_path', 'face_detected', 'num_faces',
+                    'emotion', 'emotion_confidence', 'activity', 
+                    'activity_confidence', 'pose_features', 'bbox', 
+                    'self_learning_sample', 'model_version'
+                ])
+        
+        # JSON initialization
+        if not self.json_file.exists():
+            with open(self.json_file, 'w') as f:
+                json.dump([], f)
+    
+    def save_to_csv(self, data):
+        """Save data to CSV file"""
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                data.get('timestamp', datetime.now().isoformat()),
+                data.get('image_path', ''),
+                data.get('face_detected', False),
+                data.get('num_faces', 0),
+                data.get('emotion', 'unknown'),
+                data.get('emotion_confidence', 0.0),
+                data.get('activity', 'unknown'),
+                data.get('activity_confidence', 0.0),
+                json.dumps(data.get('pose_features', [])),
+                json.dumps(data.get('bbox', [])),
+                data.get('self_learning_sample', False),
+                data.get('model_version', '1.0')
+            ])
+    
+    def save_to_json(self, data):
+        """Save data to JSON file"""
+        try:
+            with open(self.json_file, 'r') as f:
+                existing_data = json.load(f)
+        except:
+            existing_data = []
+        
+        existing_data.append(data)
+        
+        with open(self.json_file, 'w') as f:
+            json.dump(existing_data, f, indent=2)
+    
+    def save_training_sample(self, image, label, sample_type='emotion'):
+        """Save sample for self-learning training"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{sample_type}_{timestamp}.png"
+        filepath = self.config.TRAINING_DATA_DIR / filename
+        
+        # Save image
+        cv2.imwrite(str(filepath), image)
+        
+        # Save label
+        label_file = self.config.TRAINING_DATA_DIR / f"{sample_type}_{timestamp}.json"
+        with open(label_file, 'w') as f:
+            json.dump({
+                'image': filename,
+                'label': label,
+                'type': sample_type,
+                'timestamp': timestamp
+            }, f)
+        
+        return filepath
+
+# ==================== SELF-LEARNING MANAGER ====================
+class SelfLearningManager:
+    """Manages self-learning capabilities of the system"""
+    def __init__(self, config):
+        self.config = config
+        self.training_samples = []
+        self.model_versions = {}
+        
+    def collect_uncertain_sample(self, image, predictions, ground_truth=None):
+        """Collect samples when model is uncertain"""
+        max_confidence = max(predictions.values()) if predictions else 0
+        
+        if max_confidence < self.config.EMOTION_THRESHOLD:
+            # Model is uncertain about this sample
+            sample_data = {
+                'image': image.copy(),
+                'predictions': predictions,
+                'ground_truth': ground_truth,
+                'certainty': max_confidence,
+                'timestamp': datetime.now()
+            }
+            self.training_samples.append(sample_data)
+            return True
+        
+        return False
+    
+    def fine_tune_model(self, model, new_samples, epochs=5):
+        """Fine-tune model with new samples"""
+        if len(new_samples) < self.config.MIN_TRAINING_SAMPLES:
+            print(f"Not enough samples for training. Have {len(new_samples)}, need {self.config.MIN_TRAINING_SAMPLES}")
+            return model
+        
+        print(f"Fine-tuning model with {len(new_samples)} new samples...")
+        
+        # Here you would implement the actual fine-tuning
+        # For demonstration, we'll just save the model
+        model_path = self.config.MODELS_DIR / f"model_v{len(self.model_versions)+1}.pth"
+        torch.save(model.state_dict(), model_path)
+        
+        self.model_versions[model_path.stem] = {
+            'path': model_path,
+            'samples_used': len(new_samples),
+            'timestamp': datetime.now()
+        }
+        
+        return model
+
+# ==================== MAIN PIPELINE ====================
+class HumanExpressionAnalyzer:
+    """Main pipeline for human expression and body language analysis"""
+    def __init__(self, config=None):
+        self.config = config or Config()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Initialize components
+        self.face_detector = FaceDetector()
+        self.pose_detector = PoseDetector()
+        self.data_storage = DataStorage(self.config)
+        self.learning_manager = SelfLearningManager(self.config)
+        
+        # Initialize models
+        self.emotion_model = self.load_emotion_model()
+        self.transform = self.get_image_transform()
+        
+        # Statistics
+        self.stats = {
+            'images_processed': 0,
+            'faces_detected': 0,
+            'expressions_recognized': 0,
+            'uncertain_samples': 0
+        }
+    
+    def load_emotion_model(self):
+        """Load or initialize emotion detection model"""
+        model = EmotionDetector(num_emotions=7)
+        
+        # Try to load pre-trained weights
+        model_path = self.config.MODELS_DIR / "emotion_model.pth"
+        if model_path.exists():
+            try:
+                model.load_state_dict(torch.load(model_path, map_location=self.device))
+                print("Loaded pre-trained emotion model")
+            except:
+                print("Could not load pre-trained model, using initialized weights")
+        else:
+            print("No pre-trained model found, using initialized weights")
+        
+        model = model.to(self.device)
+        model.eval()
+        return model
+    
+    def get_image_transform(self):
+        """Get image transformation pipeline"""
+        return transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((self.config.IMG_SIZE, self.config.IMG_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+    
+    def detect_emotion(self, face_image):
+        """Detect emotion from face image"""
+        try:
+            # Preprocess image
+            input_tensor = self.transform(face_image).unsqueeze(0).to(self.device)
+            
+            # Get prediction
+            with torch.no_grad():
+                probabilities, features = self.emotion_model(input_tensor)
+            
+            # Get top emotion
+            probs = probabilities[0].cpu().numpy()
+            emotion_idx = np.argmax(probs)
+            confidence = probs[emotion_idx]
+            emotion = self.emotion_model.emotion_labels[emotion_idx]
+            
+            # Check if we should collect this as uncertain sample
+            if confidence < self.config.EMOTION_THRESHOLD:
+                self.learning_manager.collect_uncertain_sample(
+                    face_image, 
+                    {self.emotion_model.emotion_labels[i]: float(p) 
+                     for i, p in enumerate(probs)}
+                )
+                self.stats['uncertain_samples'] += 1
+            
+            return emotion, confidence, probs, features.cpu().numpy()
+            
+        except Exception as e:
+            print(f"Error in emotion detection: {e}")
+            return "unknown", 0.0, np.zeros(7), np.zeros(1280)
+    
+    def detect_activity(self, image, pose_landmarks):
+        """Detect activity from pose"""
+        try:
+            # Extract pose features
+            features = self.pose_detector.extract_pose_features(pose_landmarks)
+            
+            if features is None or len(features) == 0:
+                return "unknown", 0.0, features
+            
+            # Simple rule-based activity detection
+            # In production, you would use a trained classifier here
+            activity, confidence = self.rule_based_activity_detection(features)
+            
+            return activity, confidence, features
+            
+        except Exception as e:
+            print(f"Error in activity detection: {e}")
+            return "unknown", 0.0, None
+    
+    def rule_based_activity_detection(self, features):
+        """Simple rule-based activity detection"""
+        # Extract key features
+        shoulder_angle = features[0] if len(features) > 0 else 0
+        hip_angle = features[2] if len(features) > 2 else 0
+        torso_angle = features[-1] if len(features) > 0 else 0
+        
+        # Rule-based classification
+        if 70 < hip_angle < 110:  # Sitting position
+            return "sitting", 0.8
+        elif abs(torso_angle) < 20:  # Standing upright
+            return "standing", 0.7
+        elif 30 < shoulder_angle < 60:  # Walking motion
+            return "walking", 0.6
+        elif hip_angle > 120:  # Lying down
+            return "lying", 0.75
+        else:
+            return "unknown", 0.5
+    
+    def analyze_image(self, image_path):
+        """Main analysis pipeline for a single image"""
+        print(f"\nAnalyzing image: {image_path}")
+        
+        # Read image
+        image = cv2.imread(str(image_path))
+        if image is None:
+            print(f"Error: Could not read image {image_path}")
+            return None
+        
+        # Detect faces
+        faces = self.face_detector.detect_faces(image)
+        self.stats['images_processed'] += 1
+        
+        if not faces:
+            print("No faces detected in image")
+            # Store basic data even without faces
+            self.store_results(image_path, [], None, image)
+            return []
+        
+        # Process each face
+        results = []
+        self.stats['faces_detected'] += len(faces)
+        
+        for i, face in enumerate(faces):
+            print(f"Processing face {i+1}/{len(faces)} (confidence: {face['confidence']:.2f})")
+            
+            # Extract face region
+            x, y, w, h = face['bbox']
+            face_region = image[y:y+h, x:x+w]
+            
+            if face_region.size == 0:
+                continue
+            
+            # Detect emotion
+            emotion, emotion_conf, emotion_probs, emotion_features = self.detect_emotion(face_region)
+            self.stats['expressions_recognized'] += 1
+            
+            # Detect pose for activity
+            pose_results = self.pose_detector.pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            activity, activity_conf, pose_features = self.detect_activity(image, pose_results.pose_landmarks)
+            
+            # Compile results
+            result = {
+                'face_id': i,
+                'bbox': face['bbox'],
+                'face_confidence': float(face['confidence']),
+                'emotion': emotion,
+                'emotion_confidence': float(emotion_conf),
+                'emotion_probabilities': emotion_probs.tolist(),
+                'activity': activity,
+                'activity_confidence': float(activity_conf),
+                'pose_features': pose_features.tolist() if pose_features is not None else [],
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            results.append(result)
+            
+            # Display results
+            print(f"  Emotion: {emotion} ({emotion_conf:.2f})")
+            print(f"  Activity: {activity} ({activity_conf:.2f})")
+            
+            # Draw on image for visualization
+            self.draw_results(image, result)
+        
+        # Store results
+        self.store_results(image_path, results, image, len(faces) > 0)
+        
+        # Check if we should trigger self-learning
+        self.check_self_learning()
+        
+        return results
+    
+    def draw_results(self, image, result):
+        """Draw detection results on image"""
+        x, y, w, h = result['bbox']
+        
+        # Draw face bounding box
+        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        # Draw emotion text
+        emotion_text = f"{result['emotion']}: {result['emotion_confidence']:.2f}"
+        cv2.putText(image, emotion_text, (x, y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Draw activity text
+        activity_text = f"Activity: {result['activity']}"
+        cv2.putText(image, activity_text, (x, y + h + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    
+    def store_results(self, image_path, results, image, has_faces=True):
+        """Store results in all formats"""
+        # Prepare data for storage
+        for result in results:
+            storage_data = {
+                'timestamp': result['timestamp'],
+                'image_path': str(image_path),
+                'face_detected': has_faces,
+                'num_faces': len(results),
+                'emotion': result['emotion'],
+                'emotion_confidence': result['emotion_confidence'],
+                'activity': result['activity'],
+                'activity_confidence': result['activity_confidence'],
+                'pose_features': result['pose_features'],
+                'bbox': result['bbox'],
+                'self_learning_sample': result['emotion_confidence'] < self.config.EMOTION_THRESHOLD,
+                'model_version': '1.0'
+            }
+            
+            # Save to CSV and JSON
+            self.data_storage.save_to_csv(storage_data)
+            self.data_storage.save_to_json(storage_data)
+        
+        # Save visualization image if faces were detected
+        if has_faces and image is not None:
+            viz_path = self.config.DATA_DIR / f"visualization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(str(viz_path), image)
+            print(f"Visualization saved to: {viz_path}")
+    
+    def check_self_learning(self):
+        """Check if we should trigger self-learning"""
+        uncertain_samples = self.learning_manager.training_samples
+        
+        if len(uncertain_samples) >= self.config.MIN_TRAINING_SAMPLES:
+            print(f"\n⚠️  Self-learning triggered! {len(uncertain_samples)} uncertain samples collected.")
+            print("Please review and label these samples for model improvement.")
+            
+            # Save uncertain samples for review
+            samples_file = self.config.DATA_DIR / f"uncertain_samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
+            with open(samples_file, 'wb') as f:
+                pickle.dump(uncertain_samples, f)
+            print(f"Uncertain samples saved to: {samples_file}")
+            
+            # Clear collected samples after saving
+            self.learning_manager.training_samples = []
+    
+    def analyze_directory(self, directory_path):
+        """Analyze all images in a directory"""
+        directory = Path(directory_path)
+        
+        if not directory.exists():
+            print(f"Error: Directory {directory_path} does not exist")
+            return
+        
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+        image_files = []
+        
+        for ext in image_extensions:
+            image_files.extend(directory.glob(f"*{ext}"))
+            image_files.extend(directory.glob(f"*{ext.upper()}"))
+        
+        print(f"Found {len(image_files)} images in {directory_path}")
+        
+        all_results = []
+        for image_file in image_files:
+            results = self.analyze_image(image_file)
+            if results:
+                all_results.extend(results)
+        
+        self.print_statistics()
+        return all_results
+    
+    def print_statistics(self):
+        """Print system statistics"""
+        print("\n" + "="*50)
+        print("SYSTEM STATISTICS")
+        print("="*50)
+        print(f"Images processed: {self.stats['images_processed']}")
+        print(f"Faces detected: {self.stats['faces_detected']}")
+        print(f"Expressions recognized: {self.stats['expressions_recognized']}")
+        print(f"Uncertain samples collected: {self.stats['uncertain_samples']}")
+        print(f"Data stored in: {self.config.DATA_DIR}")
+        print("="*50)
+
+# ==================== UTILITY FUNCTIONS ====================
+def install_dependencies():
+    """Print installation instructions"""
+    requirements = """
+    Required dependencies:
+    
+    pip install:
+    - opencv-python>=4.5.0
+    - mediapipe>=0.8.9
+    - torch>=1.9.0
+    - torchvision>=0.10.0
+    - scikit-learn>=0.24.2
+    - pandas>=1.3.0
+    - numpy>=1.21.0
+    - Pillow>=8.3.0
+    
+    For GPU support (optional):
+    - torch with CUDA support
+    """
+    print(requirements)
+
+def test_system():
+    """Test the system with sample images"""
+    print("Testing Human Expression Analysis System...")
+    
+    # Create test directory with sample images
+    test_dir = Path("test_images")
+    test_dir.mkdir(exist_ok=True)
+    
+    # Initialize analyzer
+    config = Config()
+    analyzer = HumanExpressionAnalyzer(config)
+    
+    # Test with a single image if available
+    sample_images = list(test_dir.glob("*.*"))
+    
+    if sample_images:
+        print(f"Found {len(sample_images)} test images")
+        for img in sample_images[:3]:  # Test first 3 images
+            analyzer.analyze_image(img)
+    else:
+        print("No test images found. Please add some images to 'test_images' directory.")
+        print("You can download sample images from:")
+        print("https://www.kaggle.com/datasets/msambare/fer2013")
+    
+    analyzer.print_statistics()
+
+# ==================== ETHICAL CONSIDERATIONS ====================
+class EthicsManager:
+    """Manages ethical considerations for the system"""
+    
+    @staticmethod
+    def get_consent_guidelines():
+        guidelines = """
+        ETHICAL GUIDELINES FOR HUMAN EXPRESSION ANALYSIS:
+        
+        1. INFORMED CONSENT:
+           - Always obtain explicit consent before analyzing anyone's image
+           - Explain what data is being collected and how it will be used
+        
+        2. DATA PRIVACY:
+           - Store only extracted features, not raw images when possible
+           - Anonymize data by removing personally identifiable information
+           - Implement data encryption and secure storage
+        
+        3. BIAS MITIGATION:
+           - Test your model across diverse demographics
+           - Regularly audit for biased predictions
+           - Use diverse training data
+        
+        4. TRANSPARENCY:
+           - Be transparent about system capabilities and limitations
+           - Allow users to opt-out of analysis
+           - Provide explanations for predictions when possible
+        
+        5. COMPLIANCE:
+           - Follow GDPR, CCPA, and other relevant regulations
+           - Implement data retention policies
+           - Allow data deletion requests
+        """
+        return guidelines
+
+# ==================== MAIN EXECUTION ====================
+if __name__ == "__main__":
+    # Display ethical guidelines
+    print(EthicsManager.get_consent_guidelines())
+    
+    # Check if dependencies are installed
+    try:
+        import cv2
+        import torch
+        import mediapipe
+        
+        print("✓ All main dependencies are installed")
+    except ImportError as e:
+        print(f"✗ Missing dependency: {e}")
+        install_dependencies()
+        exit(1)
+    
+    # Example usage
+    print("\n" + "="*50)
+    print("HUMAN EXPRESSION & BODY LANGUAGE DETECTOR")
+    print("="*50)
+    
+    # Initialize the system
+    config = Config()
+    analyzer = HumanExpressionAnalyzer(config)
+    
+    # Usage examples
+    print("\nUSAGE EXAMPLES:")
+    print("1. Analyze a single image:")
+    print("   analyzer.analyze_image('path/to/your/image.jpg')")
+    
+    print("\n2. Analyze all images in a directory:")
+    print("   analyzer.analyze_directory('path/to/your/images/')")
+    
+    print("\n3. Access stored data:")
+    print(f"   CSV data: {config.CSV_OUTPUT}")
+    print(f"   JSON data: {config.JSON_OUTPUT}")
+    
+    print("\n4. Self-learning samples:")
+    print(f"   Training data: {config.TRAINING_DATA_DIR}")
+    
+    # Run test if requested
+    print("\nWould you like to run a test? (y/n)")
+    response = input().strip().lower()
+    
+    if response == 'y':
+        test_system()
+    
+    print("\nSystem initialized and ready!")
+    print("="*50)
